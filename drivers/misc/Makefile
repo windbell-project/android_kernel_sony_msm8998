@@ -80,3 +80,8 @@ obj-$(CONFIG_ONESEG_TUNER_SMTVJ19X) += oneseg_tuner_drv.o
 
 obj-$(CONFIG_HALL_BU520X1NVX) += bu520x1nvx/
 obj-$(CONFIG_SIM_DETECT) += sim_detect/
+
+# TODO: remove me b/62057517
+subdir-ccflags-y += \
+	-Wno-ignored-attributes \
+	-Wno-header-guard

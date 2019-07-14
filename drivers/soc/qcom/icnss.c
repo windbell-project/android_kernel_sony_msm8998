@@ -9,11 +9,6 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  */
-/*
- * NOTE: This file has been modified by Sony Mobile Communications Inc.
- * Modifications are Copyright (c) 2017 Sony Mobile Communications Inc,
- * and licensed under the license of the file.
- */
 
 #define pr_fmt(fmt) "icnss: " fmt
 
@@ -43,7 +38,6 @@
 #include <linux/uaccess.h>
 #include <linux/qpnp/qpnp-adc.h>
 #include <linux/etherdevice.h>
-#include <linux/poll.h>
 #include <soc/qcom/memory_dump.h>
 #include <soc/qcom/icnss.h>
 #include <soc/qcom/msm_qmi_interface.h>
@@ -500,9 +494,6 @@ static struct icnss_priv {
 	u8 requesting_sub_system;
 	u16 line_number;
 	char function_name[QMI_WLFW_FUNCTION_NAME_LEN_V01 + 1];
-	char crash_reason[SUBSYS_CRASH_REASON_LEN];
-	wait_queue_head_t wlan_pdr_debug_q;
-	int data_ready;
 	struct completion unblock_shutdown;
 } *penv;
 
@@ -1249,6 +1240,7 @@ static int wlfw_msa_mem_info_send_sync_msg(void)
 	struct wlfw_msa_info_req_msg_v01 req;
 	struct wlfw_msa_info_resp_msg_v01 resp;
 	struct msg_desc req_desc, resp_desc;
+	uint64_t max_mapped_addr;
 
 	if (!penv || !penv->wlfw_clnt)
 		return -ENODEV;
@@ -1295,9 +1287,23 @@ static int wlfw_msa_mem_info_send_sync_msg(void)
 		goto out;
 	}
 
+	max_mapped_addr = penv->msa_pa + penv->msa_mem_size;
 	penv->stats.msa_info_resp++;
 	penv->nr_mem_region = resp.mem_region_info_len;
 	for (i = 0; i < resp.mem_region_info_len; i++) {
+
+		if (resp.mem_region_info[i].size > penv->msa_mem_size ||
+		    resp.mem_region_info[i].region_addr > max_mapped_addr ||
+		    resp.mem_region_info[i].region_addr < penv->msa_pa ||
+		    resp.mem_region_info[i].size +
+		    resp.mem_region_info[i].region_addr > max_mapped_addr) {
+			icnss_pr_dbg("Received out of range Addr: 0x%llx Size: 0x%x\n",
+					resp.mem_region_info[i].region_addr,
+					resp.mem_region_info[i].size);
+			ret = -EINVAL;
+			goto fail_unwind;
+		}
+
 		penv->mem_region[i].reg_addr =
 			resp.mem_region_info[i].region_addr;
 		penv->mem_region[i].size =
@@ -1312,6 +1318,8 @@ static int wlfw_msa_mem_info_send_sync_msg(void)
 
 	return 0;
 
+fail_unwind:
+	memset(&penv->mem_region[0], 0, sizeof(penv->mem_region[0]) * i);
 out:
 	penv->stats.msa_info_err++;
 	ICNSS_QMI_ASSERT();
@@ -2776,15 +2784,6 @@ static int icnss_service_notifier_notify(struct notifier_block *nb,
 
 	icnss_pr_info("PD service down, pd_state: %d, state: 0x%lx: cause: %s\n",
 		      *state, priv->state, icnss_pdr_cause[cause]);
-	if (*state == USER_PD_STATE_CHANGE) {
-		memset(priv->crash_reason, 0, sizeof(priv->crash_reason));
-		snprintf(priv->crash_reason, sizeof(priv->crash_reason),
-		 "PD service down, pd_state: %d, state: 0x%lx: cause: %s\n",
-		 *state, priv->state, icnss_pdr_cause[cause]);
-		priv->data_ready = 1;
-		wake_up(&priv->wlan_pdr_debug_q);
-	}
-
 event_post:
 	if (!test_bit(ICNSS_FW_DOWN, &priv->state)) {
 		set_bit(ICNSS_FW_DOWN, &priv->state);
@@ -4401,39 +4400,6 @@ static int icnss_regread_open(struct inode *inode, struct file *file)
 	return single_open(file, icnss_regread_show, inode->i_private);
 }
 
-static unsigned int wlan_pdr_crash_reason_poll(struct file *filp,
-		struct poll_table_struct *wait)
-{
-	unsigned int mask = 0;
-	struct icnss_priv *priv = filp->private_data;
-
-	poll_wait(filp, &priv->wlan_pdr_debug_q, wait);
-
-	if (priv->data_ready)
-		mask |= (POLLIN | POLLRDNORM);
-
-	return mask;
-}
-
-static ssize_t wlan_pdr_crash_reason_read(struct file *filp, char __user *ubuf,
-		size_t cnt, loff_t *ppos)
-{
-	int r;
-	char buf[SUBSYS_CRASH_REASON_LEN];
-	ssize_t size = 0;
-	struct icnss_priv *priv = filp->private_data;
-
-	memset(buf, 0, sizeof(buf));
-	r = snprintf(buf, sizeof(buf), "%s", priv->crash_reason);
-	size = simple_read_from_buffer(ubuf, cnt, ppos, buf, r);
-	if (*ppos == r) {
-		memset(priv->crash_reason, 0, sizeof(priv->crash_reason));
-		priv->data_ready = 0;
-	}
-
-	return size;
-}
-
 static const struct file_operations icnss_regread_fops = {
 	.read           = seq_read,
 	.write          = icnss_regread_write,
@@ -4441,30 +4407,6 @@ static const struct file_operations icnss_regread_fops = {
 	.owner          = THIS_MODULE,
 	.llseek         = seq_lseek,
 };
-
-static const struct file_operations wlan_pdr_crash_reason_fops = {
-	.open 	= simple_open,
-	.read   = wlan_pdr_crash_reason_read,
-	.poll   = wlan_pdr_crash_reason_poll,
-	.llseek = default_llseek,
-};
-
-static void wlan_pdr_debugfs_create(struct dentry *root_dentry,
-			struct icnss_priv *priv)
-{
-	struct dentry *crash_reason_dentry;
-
-	crash_reason_dentry = debugfs_create_dir("crash_reason",
-							root_dentry);
-	if (IS_ERR(crash_reason_dentry))
-		icnss_pr_err("Unable to create debugfs %ld\n",
-					PTR_ERR(crash_reason_dentry));
-	else
-		debugfs_create_file("wlan_pdr_crash_reason", S_IRUGO | S_IWUSR,
-					crash_reason_dentry, priv,
-					&wlan_pdr_crash_reason_fops);
-
-}
 
 #ifdef CONFIG_ICNSS_DEBUG
 static int icnss_debugfs_create(struct icnss_priv *priv)
@@ -4491,7 +4433,6 @@ static int icnss_debugfs_create(struct icnss_priv *priv)
 			    &icnss_regread_fops);
 	debugfs_create_file("reg_write", 0600, root_dentry, priv,
 			    &icnss_regwrite_fops);
-	wlan_pdr_debugfs_create(root_dentry);
 
 out:
 	return ret;
@@ -4514,8 +4455,6 @@ static int icnss_debugfs_create(struct icnss_priv *priv)
 
 	debugfs_create_file("stats", 0600, root_dentry, priv,
 			    &icnss_stats_fops);
-	wlan_pdr_debugfs_create(root_dentry, priv);
-
 	return 0;
 }
 #endif
@@ -4740,7 +4679,6 @@ static int icnss_probe(struct platform_device *pdev)
 		goto out_smmu_deinit;
 	}
 
-	init_waitqueue_head(&priv->wlan_pdr_debug_q);
 	INIT_WORK(&priv->event_work, icnss_driver_event_work);
 	INIT_WORK(&priv->qmi_recv_msg_work, icnss_qmi_wlfw_clnt_notify_work);
 	INIT_LIST_HEAD(&priv->event_list);
